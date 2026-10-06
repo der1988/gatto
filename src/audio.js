@@ -1,5 +1,5 @@
 export class AmbientAudio {
-  constructor() { this.enabled = false; this.context = null; this.distance = 0; this.wasGrounded = true; }
+  constructor() { this.enabled = false; this.context = null; this.contacts = new Map(); this.wasGrounded = true; }
 
   async toggle() {
     if (!this.context) {
@@ -35,12 +35,15 @@ export class AmbientAudio {
 
   update(dt, cat, paused) {
     if (!this.enabled) return;
-    if (paused) { this.distance = 0; return; }
-    if (cat.grounded) {
-      this.distance += Math.abs(cat.vx) * dt;
-      if (this.distance > 38) { this.thud(.3 + Math.min(1, Math.abs(cat.vx) / 300) * .45); this.distance = 0; }
-      if (!this.wasGrounded) this.thud(1.5);
+    if (paused) return;
+    for (const leg of cat.legs) {
+      const contact = cat.grounded && leg.stance;
+      if (contact && this.contacts.get(leg.name) === false && Math.abs(cat.vx) > 8) {
+        this.thud(.25 + Math.min(1, Math.abs(cat.vx) / 300) * .35);
+      }
+      this.contacts.set(leg.name, contact);
     }
+    if (cat.grounded && !this.wasGrounded) this.thud(1.3);
     this.wasGrounded = cat.grounded;
   }
 }

@@ -21,8 +21,7 @@ export class World {
   constructor() {
     this.trees = new Map();
     this.particles = [];
-    this.lastSpeed = 0;
-    this.stepDistance = 0;
+    this.contacts = new Map();
     this.reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
   }
 
@@ -90,12 +89,12 @@ export class World {
     }
     this.particles = this.particles.filter(p => p.life > 0);
     const speed = Math.abs(cat.vx);
-    if (cat.grounded && speed > 100) {
-      this.stepDistance += speed * dt;
-      if (this.stepDistance > 35) {
-        this.stepDistance = 0;
-        this.dust(cat.x - cat.facing * 30, terrain(cat.x), 2, -cat.vx * .12);
+    for (const leg of cat.legs) {
+      const contact = cat.grounded && leg.stance;
+      if (contact && this.contacts.get(leg.name) === false && speed > 100) {
+        this.dust(leg.paw.x, terrain(leg.paw.x), speed > 220 ? 3 : 1, -cat.vx * .08);
       }
+      this.contacts.set(leg.name, contact);
     }
     if (cat.grounded && !this.wasGrounded) this.dust(cat.x, terrain(cat.x), 10, 0);
     this.wasGrounded = cat.grounded;
@@ -187,12 +186,13 @@ export class World {
       ctx.bezierCurveTo(x - 9, 27, x + 15, 42, x - 5, 66); ctx.stroke();
     }
 
-    const altitude = Math.max(0, terrain(cat.x) - (cat.y + 42));
+    const altitude = Math.max(0, terrain(cat.x) - (cat.y + cat.supportHeight));
     ctx.save(); ctx.translate(cat.x, terrain(cat.x) + 1); ctx.scale(1, .13);
-    const shadow = ctx.createRadialGradient(0, 0, 2, 0, 0, 65);
+    const shadowRadius = 65 * cat.size;
+    const shadow = ctx.createRadialGradient(0, 0, 2, 0, 0, shadowRadius);
     shadow.addColorStop(0, `rgba(21,26,17,${.20 / (1 + altitude * .018)})`);
     shadow.addColorStop(1, 'rgba(21,26,17,0)');
-    ctx.fillStyle = shadow; ctx.beginPath(); ctx.ellipse(0, 0, 65, 55, 0, 0, TAU); ctx.fill(); ctx.restore();
+    ctx.fillStyle = shadow; ctx.beginPath(); ctx.ellipse(0, 0, shadowRadius, 55 * cat.size, 0, 0, TAU); ctx.fill(); ctx.restore();
     cat.draw(ctx, { skeleton });
 
     for (const p of this.particles) {

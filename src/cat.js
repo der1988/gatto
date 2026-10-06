@@ -1,3 +1,6 @@
+import { drawCat } from './cat-renderer.js';
+import { sampleGallop, sampleWalk, sampleBrake } from './reference-motion.js';
+
 const TAU = Math.PI * 2;
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -9,18 +12,25 @@ const cubic = (a, b, c, d, t) => (1 - t) ** 3 * a
 const wrap = value => ((value % 1) + 1) % 1;
 const point = (x, y) => ({ x, y });
 
-// All distances are world pixels, velocities pixels/second, and Y points down.
-// The body is a driven mass; its four planted paws feed a digitigrade IK rig.
+// Physics is measured in world pixels. The photographic rig is in anatomical
+// model units, scaled once into the world; no bone changes length with its gait.
 export class Cat {
   constructor({ x = 0, terrain = () => 0 } = {}) {
+    this.size = 0.60;
+    this.supportHeight = 44 * this.size;
     this.terrain = terrain;
     this.reset(x, terrain);
   }
 
   reset(x = 0, terrain = this.terrain) {
     this.terrain = terrain || (() => 0);
-    this.x = x;
-    this.y = this.terrain(x) - 44;
+    const bounds = this.terrain.bounds;
+    this.x = bounds ? clamp(x, bounds.min + 45 * this.size, bounds.max - 45 * this.size) : x;
+    const initialPlatform = (this.terrain.platforms || []).filter(platform => this.x >= platform.x1 && this.x <= platform.x2)
+      .sort((a, b) => a.y - b.y)[0];
+    this.platformId = initialPlatform?.id || null;
+    this.supportY = initialPlatform ? initialPlatform.y : this._floorHeight();
+    this.y = this.supportY - this.supportHeight;
     this.vx = 0;
     this.vy = 0;
     this.facing = 1;
@@ -42,21 +52,41 @@ export class Cat {
     this._jumpTime = 0;
     this._jumpCut = false;
     this._landing = 0;
+    this._landingAge = 100;
+    this._gallopBlend = 0;
+    this._brakeBlend = 0;
+    this._brakeProgress = 1;
+    this.braking = false;
+    this._idleFrozen = false;
+    this._reference = sampleGallop(0);
+    this._walkReference = sampleWalk(0);
+    this._brakeReference = sampleBrake(1);
     this._tail = Array.from({ length: 9 }, (_, i) => ({ angle: -2.7 + i * 0.14, velocity: 0 }));
     this.legs = [
-      { name: 'posteriore lontana', kind: 'hind', far: true, rootX: -30, offset: 0.25 },
-      { name: 'anteriore lontana', kind: 'front', far: true, rootX: 22, offset: 0.5 },
-      { name: 'posteriore vicina', kind: 'hind', far: false, rootX: -27, offset: 0.75 },
-      { name: 'anteriore vicina', kind: 'front', far: false, rootX: 26, offset: 0 },
+      { key: 'hindFar', name: 'posteriore lontana', kind: 'hind', far: true, rootX: -30, offset: 0.25 },
+      { key: 'frontFar', name: 'anteriore lontana', kind: 'front', far: true, rootX: 22, offset: 0.5 },
+      { key: 'hindNear', name: 'posteriore vicina', kind: 'hind', far: false, rootX: -27, offset: 0.75 },
+      { key: 'frontNear', name: 'anteriore vicina', kind: 'front', far: false, rootX: 26, offset: 0 },
     ];
     this._resetFeet();
     this._updatePose();
   }
 
+  _platform() { return (this.terrain.platforms || []).find(platform => platform.id === this.platformId); }
+  _surfaceAt(x) {
+    const platform = this._platform();
+    return platform && x >= platform.x1 && x <= platform.x2 ? platform.y : this.terrain(x);
+  }
+  _contactY(x) { return this._surfaceAt(x) - 1.5 * this.size; }
+  _modelX(worldX) { return (worldX - this.x) * this.facing / this.size; }
+  _modelY(worldY) { return (worldY - this.y) / this.size; }
+  _worldX(modelX) { return this.x + this.facing * modelX * this.size; }
+  _worldY(modelY) { return this.y + modelY * this.size; }
+
   _resetFeet() {
     for (const leg of this.legs) {
-      const x = this.x + this.facing * (leg.rootX + 3);
-      leg.paw = { x, y: this.terrain(x) - 1.5 };
+      const x = this._safeFootX(this._worldX(leg.rootX + 3));
+      leg.paw = { x, y: this._contactY(x) };
       leg.from = { ...leg.paw };
       leg.to = { ...leg.paw };
       leg.stance = true;
@@ -64,76 +94,83 @@ export class Cat {
       leg.forcedSwing = false;
       leg.settling = null;
       leg.airPaw = null;
+      leg.toeAngle = Math.atan2(8, 7);
     }
   }
 
   update(dt, input = {}, terrain = this.terrain) {
-    // A fixed simulation step is expected; keep integration stable for callers
-    // that resume a tab after it has been suspended.
     dt = clamp(dt, 0, 1 / 30);
     if (!dt) return;
     this.terrain = terrain || this.terrain;
     this.time += dt;
+    this._landingAge += dt;
     const direction = clamp(input.direction || 0, -1, 1);
     const oldVx = this.vx;
-    const previousGrounded = this.grounded;
+    const previousX = this.x;
+    const previousFeetY = this.y + this.supportHeight;
+    const wasBraking = this.braking;
+    this.braking = this.grounded && Math.abs(oldVx) > 8
+      && (!direction || direction * oldVx < -8);
+    if (this.braking && !wasBraking) this._brakeProgress = 0;
+    this._brakeProgress = Math.min(1, this._brakeProgress + dt / 0.26);
+    this._brakeBlend = lerp(this._brakeBlend, this.braking ? 1 : 0, 1 - Math.exp(-dt * (this.braking ? 22 : 13)));
+    this._brakeReference = sampleBrake(this._brakeProgress);
     const maximumSpeed = input.run ? 310 : 138;
-
     if (this.grounded) {
       this._coyote = 0.1;
       if (direction) {
         const reversing = direction * this.vx < -5;
-        const acceleration = reversing ? 1010 : input.run ? 760 : 590;
-        this.vx = approach(this.vx, direction * maximumSpeed, acceleration * dt);
+        this.vx = approach(this.vx, direction * maximumSpeed,
+          (reversing ? 1400 : input.run ? 760 : 590) * dt);
       } else {
-        // Contact friction brings the body to rest over a measurable distance.
-        this.vx = approach(this.vx, 0, (400 + Math.abs(this.vx) * 0.25) * dt);
+        this.vx = approach(this.vx, 0, 1200 * dt);
       }
     } else {
       this._coyote = Math.max(0, this._coyote - dt);
-      if (direction) {
-        const target = direction * maximumSpeed;
-        // Running momentum survives releasing A during a jump.
-        if (Math.sign(this.vx) !== direction || Math.abs(this.vx) < maximumSpeed) {
-          this.vx = approach(this.vx, target, 230 * dt);
-        }
+      if (direction && (Math.sign(this.vx) !== direction || Math.abs(this.vx) < maximumSpeed)) {
+        this.vx = approach(this.vx, direction * maximumSpeed, 230 * dt);
       }
       this.vx *= Math.exp(-0.08 * dt);
     }
     this._acceleration = (this.vx - oldVx) / dt;
     this._effort = lerp(this._effort, clamp(Math.abs(this._acceleration) / 760 + Math.abs(this.vx) / 620, 0, 1), 1 - Math.exp(-dt * 5));
     this.x += this.vx * dt;
-
-    // The cat turns only once its actual momentum changes direction.
+    this._collideHorizontal(previousX);
     const newFacing = Math.abs(this.vx) > 16 ? Math.sign(this.vx)
       : Math.abs(this.vx) < 4 && direction ? direction : this.facing;
     if (newFacing !== this.facing) {
       this.facing = newFacing;
       if (this.grounded) {
+        // A quick turn transfers weight through a recovery step. Preserve the
+        // stride clock so changing direction does not restart the animation.
         this._resetFeet();
-      } else {
-        // Turning in flight must never reset a foot to the ground below.
-        for (const leg of this.legs) {
-          leg.paw = { x: this.x + this.facing * (leg.rootX + 3), y: this.y + 30 };
-          leg.airPaw = null;
-        }
+      }
+      else for (const leg of this.legs) {
+        leg.paw = { x: this._worldX(leg.rootX + 3), y: this._worldY(30) };
+        leg.airPaw = null;
       }
     }
-
     this._jumpBuffer = input.jumpPressed ? 0.13 : Math.max(0, this._jumpBuffer - dt);
     if (this._jumpBuffer > 0 && (this.grounded || this._coyote > 0)) {
       this.vy = -390;
       this.grounded = false;
+      this.platformId = null;
       this._coyote = 0;
       this._jumpBuffer = 0;
       this._jumpTime = 0;
       this._jumpCut = false;
-      this._squashVelocity = -27;
+      this._squashVelocity = 15;
       this.jumpCount += 1;
     }
-
-    const supportY = this._groundHeight();
-    const groundY = supportY - 44;
+    const platform = this._platform();
+    if (this.grounded && platform && !this._overlapsPlatform(this.x, platform)) {
+      this.grounded = false;
+      this.platformId = null;
+      this._jumpTime = 0;
+      this._coyote = 0.1;
+    }
+    this.supportY = this._groundHeight();
+    const groundY = this.supportY - this.supportHeight;
     if (!this.grounded) {
       this._jumpTime += dt;
       if (!input.jumpHeld && this.vy < -240 && !this._jumpCut) {
@@ -143,179 +180,272 @@ export class Cat {
       const holdLift = input.jumpHeld && this.vy < 0 && this._jumpTime < 0.19;
       this.vy += (holdLift ? 790 : 1080) * dt;
       this.y += this.vy * dt;
-      if (this.y >= groundY && this.vy >= 0) {
-        const impact = this.vy;
-        this.y = groundY;
-        this.vy = 0;
-        this.grounded = true;
-        this._landing = clamp(impact / 440, 0, 1);
-        this._squashVelocity += Math.min(impact * 0.075, 32);
-        // Airborne paws blend to their first contact; no sliding across the map.
-        for (const leg of this.legs) {
-          const footX = this.x + this.facing * (leg.rootX + 3 + this.vx * 0.016);
-          leg.paw = { x: footX, y: this.terrain(footX) - 1.5 };
-          leg.stance = true;
-        }
+      const ceiling = this.terrain.bounds?.ceiling;
+      if (Number.isFinite(ceiling) && this.y - 15 * this.size < ceiling) {
+        this.y = ceiling + 15 * this.size;
+        this.vy = Math.max(0, this.vy);
+      }
+      if (this.vy >= 0) {
+        const nextFeetY = this.y + this.supportHeight;
+        const candidates = [{ y: this._floorHeight(), id: null }, ...(this.terrain.platforms || [])
+          .filter(candidate => this._overlapsPlatform(this.x, candidate))]
+          .filter(candidate => previousFeetY <= candidate.y + 0.6 && nextFeetY >= candidate.y)
+          .sort((a, b) => a.y - b.y);
+        if (candidates.length) this._land(candidates[0]);
       }
     } else {
       this.y = groundY;
       this.vy = 0;
       this._jumpTime = 0;
     }
-
     this._squashVelocity += (-this._squash * 190 - this._squashVelocity * 17) * dt;
     this._squash += this._squashVelocity * dt;
     this._squash = clamp(this._squash, -2.2, 4.8);
     this._landing *= Math.exp(-dt * 7);
     this._speed = Math.abs(this.vx);
     this.gait = !this.grounded ? 'salto' : this._speed < 8 ? 'riposo'
-      : this._speed < 160 ? 'passo' : this._speed < 255 ? 'trotto' : 'galoppo';
+      : this._speed < 160 ? 'passo' : this._speed < 245 ? 'trotto' : 'galoppo';
     const terrainPitch = this.grounded
-      ? clamp((this.terrain(this.x + this.facing * 28) - this.terrain(this.x - this.facing * 28)) / 56, -0.3, 0.3) : 0;
+      ? clamp((this.terrain(this.x + this.facing * 28 * this.size) - this.terrain(this.x - this.facing * 28 * this.size)) / (56 * this.size), -0.3, 0.3) : 0;
     const pitchTarget = clamp(this._acceleration * this.facing / 22000, -0.045, 0.045)
       + (this.grounded ? 0 : clamp(this.vy / 4200, -0.07, 0.07));
     this._motionPitch = lerp(this._motionPitch, pitchTarget, 1 - Math.exp(-dt * 8));
     this._pitch = terrainPitch + this._motionPitch;
-    this._updateFeet(dt, previousGrounded);
+    const desiredGallop = smooth(clamp((this._speed - 180) / 80, 0, 1));
+    this._gallopBlend = lerp(this._gallopBlend, desiredGallop, 1 - Math.exp(-dt * 13));
+    const stride = lerp(83, 150, this._gallopBlend) * this.size;
+    this.phase = wrap(this.phase + this._speed / stride * dt);
+    this._reference = sampleGallop(this.phase);
+    this._walkReference = sampleWalk(this.phase);
+    this._updateFeet(dt);
     this._updateTail(dt);
+    const idle = this.grounded && this._speed < 0.5 && this._landingAge > 0.35
+      && this._brakeBlend < 0.01 && this._gallopBlend < 0.01
+      && this.legs.every(leg => leg.stance && !leg.settling);
+    if (!idle) this._idleFrozen = false;
     this._updatePose();
+    if (idle) this._idleFrozen = true;
   }
 
+  _floorHeight() {
+    return (this.terrain(this.x - 24 * this.size) + this.terrain(this.x + 24 * this.size)) * 0.5;
+  }
   _groundHeight() {
-    // Both ends of the spine react to slopes without introducing vertical drift.
-    return (this.terrain(this.x - 24) + this.terrain(this.x + 24)) * 0.5;
+    const platform = this._platform();
+    return platform ? platform.y : this._floorHeight();
+  }
+
+  _overlapsPlatform(x, platform) {
+    const halfWidth = 20 * this.size;
+    return x + halfWidth > platform.x1 && x - halfWidth < platform.x2;
+  }
+
+  _collideHorizontal(previousX) {
+    const halfWidth = 20 * this.size;
+    const feetY = this.y + this.supportHeight;
+    for (const platform of this.terrain.platforms || []) {
+      if (!platform.solid || platform.id === this.platformId || feetY <= platform.y + 0.1) continue;
+      if (!this._overlapsPlatform(this.x, platform)) continue;
+      // Furniture fills the volume between its top and the room floor. Entering
+      // from the side requires the feet to have cleared that top during a jump.
+      if (previousX <= platform.x1 - halfWidth + 0.1) this.x = platform.x1 - halfWidth;
+      else if (previousX >= platform.x2 + halfWidth - 0.1) this.x = platform.x2 + halfWidth;
+      else this.x = previousX < (platform.x1 + platform.x2) / 2 ? platform.x1 - halfWidth : platform.x2 + halfWidth;
+      this.vx = 0;
+    }
+    const bounds = this.terrain.bounds;
+    if (bounds) {
+      const boundedX = clamp(this.x, bounds.min + 45 * this.size, bounds.max - 45 * this.size);
+      if (boundedX !== this.x) { this.x = boundedX; this.vx = 0; }
+    }
+  }
+
+  _land(surface) {
+    const impact = this.vy;
+    this.supportY = surface.y;
+    this.platformId = surface.id || null;
+    this.y = this.supportY - this.supportHeight;
+    this.vy = 0;
+    this.grounded = true;
+    this._landingAge = 0;
+    this._landing = clamp(impact / 440, 0, 1);
+    this._squashVelocity += Math.min(impact * 0.075, 32);
+    for (const leg of this.legs) {
+      const footX = this._safeFootX(this._worldX(leg.rootX + 3) + this.vx * 0.012);
+      leg.paw = { x: footX, y: this._contactY(footX) };
+      leg.stance = leg.kind === 'front';
+      leg.airPaw = null;
+    }
+  }
+
+  _safeFootX(x) {
+    const platform = this._platform();
+    if (platform) return clamp(x, platform.x1 + 1.5 * this.size, platform.x2 - 1.5 * this.size);
+    for (const solid of this.terrain.platforms || []) {
+      if (!solid.solid || x < solid.x1 || x > solid.x2) continue;
+      x = this.x < (solid.x1 + solid.x2) / 2 ? solid.x1 - this.size : solid.x2 + this.size;
+    }
+    return x;
+  }
+
+  _updateAirFoot(leg, dt) {
+    const rising = clamp(-this.vy / 390, 0, 1);
+    const falling = clamp(this.vy / 370, 0, 1);
+    const tuck = smooth(1 - clamp(Math.abs(this.vy) / 165, 0, 1));
+    const thrust = 1 - clamp(this._jumpTime / 0.085, 0, 1);
+    const front = leg.kind === 'front';
+    let localX = front ? lerp(45, 28, tuck) : lerp(-42, -18, tuck);
+    let localY = front ? lerp(23, 17, tuck) : lerp(31, 19, tuck);
+    if (falling > 0) {
+      localX = front ? lerp(28, 40, falling) : lerp(-18, -28, falling);
+      localY = front ? lerp(17, 42, falling) : lerp(19, 36, falling);
+    }
+    if (!front) {
+      localX -= thrust * 6;
+      localY += thrust * 9;
+    } else {
+      localX += rising * 3;
+    }
+    localX += leg.far ? front ? -2 : 2 : 0;
+    if (!leg.airPaw) leg.airPaw = { x: this._modelX(leg.paw.x), y: this._modelY(leg.paw.y) };
+    const blend = 1 - Math.exp(-dt * 23);
+    leg.airPaw.x = lerp(leg.airPaw.x, localX, blend);
+    leg.airPaw.y = lerp(leg.airPaw.y, localY, blend);
+    leg.paw = { x: this._worldX(leg.airPaw.x), y: this._worldY(leg.airPaw.y) };
+    leg.stance = false;
+    leg.forcedSwing = false;
+    leg.settling = null;
   }
 
   _updateFeet(dt) {
-    const speed = this._speed;
-    const trot = smooth(clamp((speed - 135) / 75, 0, 1));
-    const gallop = smooth(clamp((speed - 235) / 55, 0, 1));
-    const stride = lerp(lerp(66, 82, trot), 100, gallop);
-    const frequency = speed / stride;
-    const duty = lerp(lerp(0.68, 0.56, trot), 0.43, gallop);
-    this.phase = wrap(this.phase + frequency * dt);
-
     for (const leg of this.legs) {
-      const walkOffset = leg.kind === 'front' ? leg.far ? 0.5 : 0 : leg.far ? 0.25 : 0.75;
-      const trotOffset = leg.kind === 'front' ? leg.far ? 0.5 : 0 : leg.far ? 0 : 0.5;
-      const gallopOffset = leg.kind === 'front' ? leg.far ? 0.18 : 0.06 : leg.far ? 0.68 : 0.56;
-      let targetOffset = lerp(walkOffset, trotOffset, trot);
-      let offsetDistance = gallopOffset - targetOffset;
-      if (offsetDistance > 0.5) offsetDistance -= 1;
-      if (offsetDistance < -0.5) offsetDistance += 1;
-      targetOffset = wrap(targetOffset + offsetDistance * gallop);
-      let offsetDelta = targetOffset - leg.offset;
-      if (offsetDelta > 0.5) offsetDelta -= 1;
-      if (offsetDelta < -0.5) offsetDelta += 1;
-      leg.offset = wrap(leg.offset + offsetDelta * Math.min(1, dt * 7));
-
-      if (!this.grounded) {
-        const rising = clamp(-this.vy / 390, 0, 1);
-        const falling = clamp(this.vy / 390, 0, 1);
-        const farOffset = leg.far ? 3 : 0;
-        const localX = leg.kind === 'front'
-          ? 29 + rising * 15 + falling * 8 + farOffset
-          : -26 - rising * 10 - falling * 7 - farOffset;
-        const localY = 26 - rising * 7 + falling * 12;
-        const blend = 1 - Math.exp(-dt * 16);
-        if (!leg.airPaw) {
-          leg.airPaw = { x: (leg.paw.x - this.x) * this.facing, y: leg.paw.y - this.y };
-        }
-        // An airborne paw travels with its torso; interpolate only articulation
-        // so a fast rising body cannot pull the leg beyond its bone lengths.
-        leg.airPaw.x = lerp(leg.airPaw.x, localX, blend);
-        leg.airPaw.y = lerp(leg.airPaw.y, localY, blend);
-        leg.paw.x = this.x + this.facing * leg.airPaw.x;
-        leg.paw.y = this.y + leg.airPaw.y;
-        leg.stance = false;
-        leg.forcedSwing = false;
-        leg.settling = null;
-        continue;
-      }
+      if (!this.grounded) { this._updateAirFoot(leg, dt); continue; }
       leg.airPaw = null;
-
-      if (speed < 8 || leg.settling) {
-        // Preserve each contact at rest. Only recover a paw that is too extended.
-        const relativeX = (leg.paw.x - this.x) * this.facing - leg.rootX;
-        if (!leg.settling && (Math.abs(relativeX) > 18 || !leg.stance)) {
-          const targetX = this.x + this.facing * (leg.rootX + 3);
-          leg.settling = { from: { ...leg.paw }, to: { x: targetX, y: this.terrain(targetX) - 1.5 }, progress: 0 };
-        }
-        if (leg.settling) {
-          const step = leg.settling;
-          step.progress = Math.min(1, step.progress + dt / 0.17);
-          const eased = smooth(step.progress);
-          leg.paw.x = lerp(step.from.x, step.to.x, eased);
-          leg.paw.y = lerp(step.from.y, step.to.y, eased) - Math.sin(step.progress * Math.PI) * 4;
-          leg.stance = false;
-          if (step.progress === 1) {
-            leg.settling = null;
-            leg.stance = true;
-            leg.offset = wrap(-this.phase);
-          }
-        } else {
-          leg.paw.y = this.terrain(leg.paw.x) - 1.5;
+      if (this._landingAge < 0.10) {
+        if (leg.kind === 'front') {
+          leg.paw.y = this._contactY(leg.paw.x);
           leg.stance = true;
+        } else {
+          const p = smooth(clamp(this._landingAge / 0.075, 0, 1));
+          const x = this._worldX(leg.rootX + 3);
+          if (!leg.stance) leg.paw = { x, y: this._contactY(x) - (1 - p) * 11 * this.size };
+          if (p === 1) { leg.stance = true; leg.paw.y = this._contactY(leg.paw.x); }
         }
-        leg.forcedSwing = false;
         continue;
       }
+      if (this._speed < 8 || leg.settling) { this._settleFoot(leg, dt); continue; }
+      if (this._gallopBlend > 0.5) { this._referenceFoot(leg, dt); continue; }
+      this._walkFoot(leg, dt);
+    }
+  }
 
-      let cycle = wrap(this.phase + leg.offset);
-      const reach = stride * duty * 0.49;
-      const relativeX = (leg.paw.x - this.x) * this.facing - leg.rootX;
-      // Accelerating or changing gait can shorten a stance. Lift before the
-      // planted limb reaches its anatomical limit, rather than sliding the paw.
-      if (leg.stance && cycle < duty && relativeX < -reach - 4) {
-        leg.forcedSwing = true;
-        leg.forcedProgress = 0;
+  _settleFoot(leg, dt) {
+    const relativeX = this._modelX(leg.paw.x) - leg.rootX;
+    if (!leg.settling && (Math.abs(relativeX) > 18 || !leg.stance)) {
+      const x = this._safeFootX(this._worldX(leg.rootX + 3));
+      leg.settling = { from: { ...leg.paw }, to: { x, y: this._contactY(x) }, progress: 0 };
+    }
+    if (leg.settling) {
+      const step = leg.settling;
+      step.progress = Math.min(1, step.progress + dt / 0.17);
+      const eased = smooth(step.progress);
+      leg.paw = { x: lerp(step.from.x, step.to.x, eased),
+        y: lerp(step.from.y, step.to.y, eased) - Math.sin(step.progress * Math.PI) * 4 * this.size };
+      leg.stance = false;
+      if (step.progress === 1) {
+        leg.settling = null;
+        leg.stance = true;
+        leg.offset = wrap(-this.phase);
       }
-      if (leg.forcedSwing) {
-        leg.forcedProgress += frequency * dt / (1 - duty);
-        if (leg.forcedProgress >= 1) {
-          leg.forcedSwing = false;
-          leg.offset = wrap(-this.phase);
-          cycle = 0;
-        } else {
-          cycle = duty + leg.forcedProgress * (1 - duty);
-        }
+    } else { leg.paw.y = this._contactY(leg.paw.x); leg.stance = true; }
+    leg.forcedSwing = false;
+  }
+
+  _referenceFoot(leg, dt) {
+    const reference = this._reference.legs[leg.key];
+    leg.forcedSwing = false;
+    if (reference.contact) {
+      if (!leg.stance) {
+        const x = this._worldX(reference.x);
+        leg.paw = { x, y: this._contactY(x) };
       }
-      const inStance = cycle < duty;
-      if (!inStance) {
-        const p = clamp((cycle - duty) / (1 - duty), 0, 1);
-        if (leg.stance) {
-          leg.from = { ...leg.paw };
-          leg.fromLocal = (leg.paw.x - this.x) * this.facing - leg.rootX;
-          leg.swingProgress = p;
-          leg.stance = false;
-        }
-        const normalized = clamp((p - leg.swingProgress) / Math.max(0.08, 1 - leg.swingProgress), 0, 1);
-        const travel = stride * (1 - duty) / 3;
-        // Endpoint derivatives cancel body velocity at lift-off and touchdown.
-        // Working in body space lets the stride adapt immediately to acceleration.
-        const relative = cubic(leg.fromLocal, leg.fromLocal - travel,
-          reach + travel, reach, normalized);
-        leg.paw.x = this.x + this.facing * (leg.rootX + relative);
-        leg.paw.y = this.terrain(leg.paw.x) - 1.5
-          - Math.sin(normalized * Math.PI) * lerp(10, 22, gallop);
-        const landingX = this.x + this.facing * (leg.rootX + reach);
-        leg.to = { x: landingX, y: this.terrain(landingX) - 1.5 };
-      } else {
-        if (!leg.stance) {
-          leg.paw = { ...leg.to };
-          leg.stance = true;
-        }
-        leg.paw.y = this.terrain(leg.paw.x) - 1.5;
+      leg.stance = true;
+      leg.paw.y = this._contactY(leg.paw.x);
+    } else {
+      const x = this._worldX(reference.x);
+      const y = this._worldY(reference.y - this._reference.bodyLift);
+      const blend = 1 - Math.exp(-dt * 42);
+      const actualX = lerp(leg.paw.x, x, blend);
+      leg.paw = { x: actualX,
+        y: Math.min(this._contactY(actualX) - 0.35 * this.size, lerp(leg.paw.y, y, blend)) };
+      leg.stance = false;
+    }
+    // Returning to a slower gait must initialize its next swing afresh.
+    leg.fromLocal = this._modelX(leg.paw.x) - leg.rootX;
+    leg.swingProgress = 0;
+  }
+
+  _walkFoot(leg, dt) {
+    const trot = smooth(clamp((this._speed - 125) / 70, 0, 1));
+    const stride = 83;
+    const duty = lerp(0.68, 0.55, trot);
+    const frequency = this._speed / (stride * this.size);
+    const walkOffset = leg.kind === 'front' ? leg.far ? 0.5 : 0 : leg.far ? 0.25 : 0.75;
+    const trotOffset = leg.kind === 'front' ? leg.far ? 0.5 : 0 : leg.far ? 0 : 0.5;
+    const targetOffset = lerp(walkOffset, trotOffset, trot);
+    let delta = targetOffset - leg.offset;
+    if (delta > 0.5) delta -= 1;
+    if (delta < -0.5) delta += 1;
+    leg.offset = wrap(leg.offset + delta * Math.min(1, dt * 7));
+    let cycle = wrap(this.phase + leg.offset);
+    const reach = stride * duty * 0.44;
+    const relativeX = this._modelX(leg.paw.x) - leg.rootX;
+    if (leg.stance && cycle < duty && relativeX < -reach - 3) {
+      leg.forcedSwing = true;
+      leg.forcedProgress = 0;
+    }
+    if (leg.forcedSwing) {
+      leg.forcedProgress += frequency * dt / (1 - duty);
+      if (leg.forcedProgress >= 1) {
+        leg.forcedSwing = false;
+        leg.offset = wrap(-this.phase);
+        cycle = 0;
+      } else cycle = duty + leg.forcedProgress * (1 - duty);
+    }
+    if (cycle >= duty) {
+      const p = clamp((cycle - duty) / (1 - duty), 0, 1);
+      if (leg.stance) {
+        leg.fromLocal = this._modelX(leg.paw.x) - leg.rootX;
+        leg.swingProgress = p;
+        leg.stance = false;
       }
+      const normalized = clamp((p - leg.swingProgress) / Math.max(0.08, 1 - leg.swingProgress), 0, 1);
+      const travel = stride * (1 - duty) / 3;
+      const relative = cubic(leg.fromLocal, leg.fromLocal - travel, reach + travel, reach, normalized);
+      const x = this._worldX(leg.rootX + relative);
+      leg.paw = { x, y: this._contactY(x) - Math.sin(normalized * Math.PI) * 12 * this.size };
+      const landingX = this._worldX(leg.rootX + reach);
+      leg.to = { x: landingX, y: this._contactY(landingX) };
+    } else {
+      if (!leg.stance) {
+        // The previous gait may have stored its last landing far away. Compute
+        // this touchdown from the current mass, never reuse a world-space goal.
+        const x = this._worldX(leg.rootX + reach);
+        leg.paw = { x, y: this._contactY(x) };
+        leg.stance = true;
+      }
+      leg.paw.y = this._contactY(leg.paw.x);
     }
   }
 
   _updateTail(dt) {
-    const running = clamp(this._speed / 290, 0, 1);
+    const running = this._gallopBlend;
     for (let i = 0; i < this._tail.length; i += 1) {
       const joint = this._tail[i];
       const idleAngle = -2.7 + i * 0.14;
-      const runAngle = -3.01 + Math.sin(this.phase * TAU - i * 0.5) * (0.08 + i * 0.016);
+      const tipCurl = smooth(clamp((i / 8 - 0.35) / 0.65, 0, 1)) * 0.85;
+      const runAngle = this._reference.tailAngle + tipCurl
+        + Math.sin(this.phase * TAU - i * 0.45) * (0.02 + i * 0.01);
       const inertial = clamp(-this._acceleration * this.facing / 15000, -0.08, 0.08) * (i + 1) / 9;
       const target = lerp(idleAngle, runAngle, running)
         + Math.sin(this.time * 1.7 - i * 0.3) * 0.025 + inertial
@@ -326,295 +456,150 @@ export class Cat {
   }
 
   _updatePose() {
+    if (this._idleFrozen && this.pose) {
+      this._buildTail();
+      return;
+    }
+    const blend = this.grounded ? this._gallopBlend : 0;
+    const reference = this._reference;
+    const walk = this._walkReference;
+    const brake = this._brakeReference;
+    const braking = this.grounded ? this._brakeBlend : 0;
     const movement = clamp(this._speed / 150, 0, 1);
-    const gallop = clamp((this._speed - 240) / 65, 0, 1);
-    const cycle = this.phase * TAU;
-    const breathing = Math.sin(this.time * 2.1) * 0.35 * (1 - movement);
-    const bob = this.grounded ? Math.cos(cycle * (gallop > 0.5 ? 1 : 2)) * movement * lerp(1, 2.4, gallop) : 0;
-    const flex = Math.sin(cycle) * gallop * 2.5;
-    const naturalBase = breathing + bob + this._squash;
+    const jumpCrouch = !this.grounded ? (1 - clamp(this._jumpTime / 0.07, 0, 1)) * 3.2 : 0;
+    const apexTuck = !this.grounded ? smooth(1 - clamp(Math.abs(this.vy) / 165, 0, 1)) : 0;
+    const bodyLift = this.grounded ? lerp(walk.bodyLift * movement, reference.bodyLift, blend) * (1 - braking) : 0;
+    const naturalBase = this._squash + jumpCrouch - bodyLift;
+    const hipShape = point(lerp(lerp(-28, walk.hip.x, movement), reference.hip.x, blend),
+      lerp(lerp(4, walk.hip.y, movement), reference.hip.y, blend));
+    const shoulderShape = point(lerp(lerp(25, walk.shoulder.x, movement), reference.shoulder.x, blend),
+      lerp(lerp(4, walk.shoulder.y, movement), reference.shoulder.y, blend));
+    hipShape.x = lerp(hipShape.x, brake.hip.x, braking);
+    hipShape.y = lerp(hipShape.y, brake.hip.y, braking);
+    shoulderShape.x = lerp(shoulderShape.x, brake.shoulder.x, braking);
+    shoulderShape.y = lerp(shoulderShape.y, brake.shoulder.y, braking);
     let necessaryDrop = 0;
-    if (this.grounded) {
-      for (const leg of this.legs) {
-        if (!leg.stance) continue;
-        const front = leg.kind === 'front';
-        const rootX = leg.rootX + (front ? -flex * 0.3 : flex * 0.35);
-        const rootY = naturalBase + (front ? 2 + this._pitch * 25 : 4 - this._pitch * 28)
-          - (leg.far ? 1.5 : 0);
-        const ankleX = (leg.paw.x - this.x) * this.facing - (front ? 1 : 7);
-        const ankleY = leg.paw.y - this.y - (front ? 5 : 8);
-        const combinedReach = front ? 45.3 : 53.3;
-        const allowedVertical = Math.sqrt(Math.max(1, combinedReach ** 2 - (ankleX - rootX) ** 2));
-        necessaryDrop = Math.max(necessaryDrop, ankleY - rootY - allowedVertical);
-      }
+    if (this.grounded) for (const leg of this.legs) {
+      if (!leg.stance) continue;
+      const front = leg.kind === 'front';
+      const shape = front ? shoulderShape : hipShape;
+      const rootX = shape.x + leg.rootX - (front ? 25 : -28);
+      const rootY = naturalBase + shape.y + this._pitch * shape.x - (front ? 2 : 0) - (leg.far ? 1.5 : 0);
+      const ankleX = this._modelX(leg.paw.x) - (front ? 1 : Math.cos(leg.toeAngle) * Math.hypot(7, 8));
+      const ankleY = this._modelY(leg.paw.y) - (front ? 5 : Math.sin(leg.toeAngle) * Math.hypot(7, 8));
+      const combinedReach = front ? 45.3 : 53.3;
+      const allowedVertical = Math.sqrt(Math.max(1, combinedReach ** 2 - (ankleX - rootX) ** 2));
+      necessaryDrop = Math.max(necessaryDrop, ankleY - rootY - allowedVertical);
     }
-    // On a crest, bend the spine down toward a low planted paw before extending
-    // any bone. Relax smoothly once all contacts can reach the normal posture.
-    this._rigDrop = Math.max(clamp(necessaryDrop, 0, 12), this._rigDrop * 0.94);
+    this._rigDrop = Math.max(clamp(necessaryDrop, 0, 18), this._rigDrop * 0.92);
     const base = naturalBase + this._rigDrop;
-    const hip = point(-28 + flex * 0.35, base + 4 - this._pitch * 28);
-    const shoulder = point(25 - flex * 0.3, base + 4 + this._pitch * 25);
+    const hip = point(hipShape.x, base + hipShape.y + this._pitch * hipShape.x);
+    const shoulder = point(shoulderShape.x, base + shoulderShape.y + this._pitch * shoulderShape.x);
+    const headX = lerp(lerp(lerp(51, walk.head.x, movement), reference.head.x, blend), brake.head.x, braking);
+    const headY = base + lerp(lerp(lerp(-8, walk.head.y, movement), reference.head.y, blend), brake.head.y, braking)
+      + this._pitch * headX * (1 - blend * 0.6);
+    const spineArch = lerp(lerp(walk.spineArch * movement, reference.spineArch, blend), brake.spineArch, braking) + apexTuck * 3.2;
     this.pose = {
-      base, hip, shoulder, flex,
-      neck: point(38 - flex * 0.2, base - 5 + this._pitch * 40),
-      head: point(51 - flex * 0.2, base - 11 + this._pitch * 48 + (this.grounded ? -bob * 0.45 : 0)),
-      tail: [point(-35 + flex * 0.2, base - 2)],
+      base, hip, shoulder, head: point(headX, headY),
+      neck: point(lerp(38, (shoulder.x + headX) * 0.53, blend), lerp(base - 5, (shoulder.y + headY) * 0.5, blend)),
+      spineArch, flex: spineArch, referenceBlend: blend, phase: this.phase,
+      braking: this.braking, brakeBlend: braking,
+      suspension: this.grounded && this._gallopBlend > 0.5 && this.legs.every(leg => !leg.stance),
+      motionPhase: !this.grounded ? this.vy < -115 ? 'slancio' : this.vy > 115 ? 'atterraggio' : 'raccolto'
+        : this.legs.every(leg => !leg.stance) ? 'sospensione' : 'appoggio',
+      tail: [],
     };
+    this._buildTail();
+    for (const leg of this.legs) this._solveLeg(leg);
+    this.pose.suspension = this.grounded && this._gallopBlend > 0.5 && this.legs.every(leg => !leg.stance);
+  }
+
+  _buildTail() {
+    const hip = this.pose.hip;
+    this.pose.tail = [point(hip.x - 8, hip.y - 6)];
     for (let i = 0; i < this._tail.length; i += 1) {
-      const previous = this.pose.tail[this.pose.tail.length - 1];
-      const length = 6.5 - i * 0.13;
-      const angle = this._tail[i].angle;
-      this.pose.tail.push(point(previous.x + Math.cos(angle) * length, previous.y + Math.sin(angle) * length));
+      const previous = this.pose.tail.at(-1);
+      const length = 5.25 - i * 0.095;
+      this.pose.tail.push(point(previous.x + Math.cos(this._tail[i].angle) * length,
+        previous.y + Math.sin(this._tail[i].angle) * length));
     }
-    for (const leg of this.legs) {
-      const root = leg.kind === 'front' ? { ...shoulder } : { ...hip };
-      root.x += leg.rootX - (leg.kind === 'front' ? 25 : -28);
-      root.y -= leg.kind === 'front' ? 2 : 0;
-      root.y += leg.far ? -1.5 : 0;
-      const paw = point((leg.paw.x - this.x) * this.facing, leg.paw.y - this.y);
-      const ankle = leg.kind === 'hind' ? point(paw.x - 7, paw.y - 8)
-        : point(paw.x - 1, paw.y - 5);
-      const reach = Math.hypot(ankle.x - root.x, ankle.y - root.y);
-      const anatomicalReach = leg.kind === 'hind' ? 45.5 : 37.5;
-      if (reach > anatomicalReach) {
-        // Scapular glide and pelvic excursion accommodate the final few pixels
-        // of extension while the toe remains fixed against the ground.
-        const glide = Math.min(8, reach - anatomicalReach);
-        root.x += (ankle.x - root.x) / reach * glide;
-        root.y += (ankle.y - root.y) / reach * glide;
-      }
-      const remainingReach = Math.hypot(ankle.x - root.x, ankle.y - root.y);
-      if (!leg.stance && remainingReach > anatomicalReach) {
-        // A swinging paw has no contact constraint. Project the target into the
-        // reachable disk instead of stretching a forearm to chase the terrain.
-        const ratio = anatomicalReach / remainingReach;
-        const constrainedX = root.x + (ankle.x - root.x) * ratio;
-        const constrainedY = root.y + (ankle.y - root.y) * ratio;
+  }
+
+  _solveLeg(leg) {
+    const front = leg.kind === 'front';
+    const root = { ...(front ? this.pose.shoulder : this.pose.hip) };
+    root.x += leg.rootX - (front ? 25 : -28);
+    root.y -= (front ? 2 : 0) + (leg.far ? 1.5 : 0);
+    const paw = point(this._modelX(leg.paw.x), this._modelY(leg.paw.y));
+    const stanceAngle = Math.atan2(8, 7);
+    if (!front) {
+      const trailing = !leg.stance ? smooth(clamp((root.x - paw.x - 5) / 20, 0, 1)) : 0;
+      const desiredAngle = lerp(stanceAngle, Math.atan2(7, -8), trailing);
+      leg.toeAngle = lerp(leg.toeAngle, desiredAngle, 0.28);
+    }
+    const ankle = point(paw.x - (front ? 1 : Math.cos(leg.toeAngle) * Math.hypot(7, 8)),
+      paw.y - (front ? 5 : Math.sin(leg.toeAngle) * Math.hypot(7, 8)));
+    const anatomicalReach = front ? 37.5 : 45.5;
+    const reach = Math.hypot(ankle.x - root.x, ankle.y - root.y);
+    if (reach > anatomicalReach) {
+      const glide = Math.min(8, reach - anatomicalReach);
+      root.x += (ankle.x - root.x) / reach * glide;
+      root.y += (ankle.y - root.y) / reach * glide;
+    }
+    let remainingReach = Math.hypot(ankle.x - root.x, ankle.y - root.y);
+    if (remainingReach < 2.05) {
+      // Unequal upper/lower bones cannot fold into a zero-radius target. Keep
+      // the small inner exclusion disk too, including during a braking tuck.
+      const ux = remainingReach > 0.001 ? (ankle.x - root.x) / remainingReach : 0;
+      const uy = remainingReach > 0.001 ? (ankle.y - root.y) / remainingReach : 1;
+      if (leg.stance) {
+        root.x = ankle.x - ux * 2.05;
+        root.y = ankle.y - uy * 2.05;
+      } else {
+        const constrainedX = root.x + ux * 2.05;
+        const constrainedY = root.y + uy * 2.05;
         paw.x += constrainedX - ankle.x;
         paw.y += constrainedY - ankle.y;
         ankle.x = constrainedX;
         ankle.y = constrainedY;
-        leg.paw.x = this.x + this.facing * paw.x;
-        leg.paw.y = this.y + paw.y;
+        leg.paw = { x: this._worldX(paw.x), y: this._worldY(paw.y) };
+        if (leg.airPaw) leg.airPaw = { ...paw };
       }
-      const bend = leg.kind === 'hind' ? -1 : 1;
-      const joint = this._ik(root, ankle, leg.kind === 'hind' ? 22 : 18, leg.kind === 'hind' ? 24 : 20, bend);
-      leg.pose = { root, joint, ankle, paw };
+      remainingReach = 2.05;
     }
+    if (leg.stance && remainingReach > (front ? 37.9 : 45.9)) {
+      // A handoff can inherit a paw behind the new, more extended torso. The
+      // animal lifts that unsupported toe for a recovery step; stretching the
+      // skeleton or dragging a planted contact would violate the constraint.
+      leg.stance = false;
+    }
+    if (!leg.stance && remainingReach > anatomicalReach) {
+      const ratio = anatomicalReach / remainingReach;
+      const constrainedX = root.x + (ankle.x - root.x) * ratio;
+      const constrainedY = root.y + (ankle.y - root.y) * ratio;
+      paw.x += constrainedX - ankle.x;
+      paw.y += constrainedY - ankle.y;
+      ankle.x = constrainedX;
+      ankle.y = constrainedY;
+      leg.paw = { x: this._worldX(paw.x), y: this._worldY(paw.y) };
+      if (leg.airPaw) leg.airPaw = { ...paw };
+    }
+    const joint = this._ik(root, ankle, front ? 18 : 22, front ? 20 : 24, front ? 1 : -1);
+    leg.pose = { root, joint, ankle, paw, footAngle: front ? 0 : leg.toeAngle,
+      footRotation: front ? 0 : leg.toeAngle - stanceAngle };
   }
 
   _ik(root, foot, upper, lower, bend) {
     const dx = foot.x - root.x;
     const dy = foot.y - root.y;
-    const distance = clamp(Math.hypot(dx, dy), 0.01, upper + lower - 0.05);
+    const distance = clamp(Math.hypot(dx, dy), Math.abs(upper - lower) + 0.01, upper + lower - 0.05);
     const direction = Math.atan2(dy, dx);
     const angle = Math.acos(clamp((upper * upper + distance * distance - lower * lower) / (2 * upper * distance), -1, 1));
     return point(root.x + Math.cos(direction + angle * bend) * upper,
       root.y + Math.sin(direction + angle * bend) * upper);
   }
 
-  draw(ctx, { skeleton = false } = {}) {
-    const altitude = Math.max(0, this._groundHeight() - 44 - this.y);
-    ctx.save();
-    ctx.fillStyle = `rgba(24, 31, 34, ${0.13 * Math.max(0.2, 1 - altitude / 120)})`;
-    ctx.beginPath();
-    ctx.ellipse(this.x, this.terrain(this.x) + 1, 46 - Math.min(12, altitude * 0.12), 3.2, 0, 0, TAU);
-    ctx.fill();
-    ctx.translate(this.x, this.y);
-    ctx.scale(this.facing, 1);
-    this._drawTail(ctx);
-    for (const leg of this.legs.filter(leg => leg.far)) this._drawLeg(ctx, leg, '#283032');
-    this._drawBody(ctx);
-    for (const leg of this.legs.filter(leg => !leg.far)) this._drawLeg(ctx, leg, '#101719');
-    this._drawHead(ctx);
-    if (skeleton) this._drawSkeleton(ctx);
-    ctx.restore();
-  }
-
-  _drawTail(ctx) {
-    const nodes = this.pose.tail;
-    const left = [];
-    const right = [];
-    for (let i = 0; i < nodes.length; i += 1) {
-      const previous = nodes[Math.max(0, i - 1)];
-      const next = nodes[Math.min(nodes.length - 1, i + 1)];
-      const angle = Math.atan2(next.y - previous.y, next.x - previous.x) + Math.PI / 2;
-      const radius = lerp(4.2, 0.85, i / (nodes.length - 1));
-      left.push(point(nodes[i].x + Math.cos(angle) * radius, nodes[i].y + Math.sin(angle) * radius));
-      right.push(point(nodes[i].x - Math.cos(angle) * radius, nodes[i].y - Math.sin(angle) * radius));
-    }
-    ctx.fillStyle = '#101719';
-    ctx.beginPath();
-    ctx.moveTo(left[0].x, left[0].y);
-    this._smoothPath(ctx, left.slice(1));
-    this._smoothPath(ctx, right.reverse());
-    ctx.closePath();
-    ctx.fill();
-  }
-
-  _smoothPath(ctx, points) {
-    for (let i = 0; i < points.length - 1; i += 1) {
-      const next = points[i + 1];
-      ctx.quadraticCurveTo(points[i].x, points[i].y, (points[i].x + next.x) / 2, (points[i].y + next.y) / 2);
-    }
-    if (points.length) ctx.lineTo(points[points.length - 1].x, points[points.length - 1].y);
-  }
-
-  _drawBody(ctx) {
-    const { hip, shoulder, base, flex } = this.pose;
-    ctx.fillStyle = '#101719';
-    ctx.beginPath();
-    ctx.moveTo(hip.x - 10, hip.y - 3);
-    ctx.bezierCurveTo(hip.x - 14, hip.y - 18, -15, base - 15 + flex, 4, base - 12 - flex * 0.4);
-    ctx.bezierCurveTo(18, base - 14, shoulder.x + 9, shoulder.y - 15, shoulder.x + 14, shoulder.y - 4);
-    ctx.bezierCurveTo(shoulder.x + 18, shoulder.y + 2, shoulder.x + 10, shoulder.y + 13, shoulder.x + 2, shoulder.y + 13);
-    ctx.bezierCurveTo(10, base + 15, -4, base + 7, -17, base + 10);
-    ctx.bezierCurveTo(hip.x - 2, hip.y + 13, hip.x - 13, hip.y + 11, hip.x - 10, hip.y - 3);
-    ctx.closePath();
-    ctx.fill();
-    // Small shoulder and haunch masses join the articulated limbs to the torso.
-    ctx.beginPath();
-    ctx.ellipse(hip.x, hip.y + 1, 11.5, 11, -0.25, 0, TAU);
-    ctx.ellipse(shoulder.x, shoulder.y + 1, 8.5, 12, 0.15, 0, TAU);
-    ctx.fill();
-  }
-
-  _drawLeg(ctx, leg, color) {
-    const { root, joint, ankle, paw } = leg.pose;
-    ctx.fillStyle = color;
-    const radii = leg.kind === 'hind' ? [7.8, 4.7, 2.8, 2.4] : [5.8, 3.9, 2.5, 2.5];
-    const nodes = [root, joint, ankle, paw];
-    // The tapered envelope follows bone segments rather than scaling a sprite.
-    const left = [];
-    const right = [];
-    for (let i = 0; i < nodes.length; i += 1) {
-      const previous = nodes[Math.max(0, i - 1)];
-      const next = nodes[Math.min(nodes.length - 1, i + 1)];
-      const angle = Math.atan2(next.y - previous.y, next.x - previous.x) + Math.PI / 2;
-      left.push(point(nodes[i].x + Math.cos(angle) * radii[i], nodes[i].y + Math.sin(angle) * radii[i]));
-      right.push(point(nodes[i].x - Math.cos(angle) * radii[i], nodes[i].y - Math.sin(angle) * radii[i]));
-    }
-    ctx.beginPath();
-    ctx.moveTo(left[0].x, left[0].y);
-    this._smoothPath(ctx, left.slice(1));
-    this._smoothPath(ctx, right.reverse());
-    ctx.closePath();
-    ctx.fill();
-    ctx.beginPath();
-    ctx.ellipse(paw.x + 2.2, paw.y - 0.5, 5.1, 2.6, -0.04, 0, TAU);
-    ctx.fill();
-  }
-
-  _drawHead(ctx) {
-    const { head, neck, shoulder } = this.pose;
-    ctx.fillStyle = '#101719';
-    ctx.beginPath();
-    ctx.moveTo(shoulder.x - 2, shoulder.y - 11);
-    ctx.bezierCurveTo(neck.x - 3, neck.y - 11, head.x - 7, head.y - 8, head.x + 2, head.y - 8);
-    ctx.lineTo(head.x + 10, head.y - 10);
-    ctx.bezierCurveTo(head.x + 15, head.y - 6, head.x + 12, head.y - 1, head.x + 17, head.y + 1);
-    ctx.quadraticCurveTo(head.x + 20, head.y + 2, head.x + 17, head.y + 5);
-    ctx.lineTo(head.x + 12, head.y + 6);
-    ctx.quadraticCurveTo(head.x + 6, head.y + 13, head.x - 2, head.y + 9);
-    ctx.bezierCurveTo(neck.x + 1, neck.y + 12, shoulder.x + 8, shoulder.y + 11, shoulder.x + 2, shoulder.y + 10);
-    ctx.closePath();
-    ctx.fill();
-    // Two triangular ears with curved outer edges and an angular feline muzzle.
-    ctx.beginPath();
-    ctx.moveTo(head.x - 8, head.y - 6);
-    ctx.quadraticCurveTo(head.x - 10, head.y - 12, head.x - 8, head.y - 21);
-    ctx.quadraticCurveTo(head.x - 2, head.y - 17, head.x + 1, head.y - 9);
-    ctx.moveTo(head.x + 1, head.y - 7);
-    ctx.quadraticCurveTo(head.x + 4, head.y - 16, head.x + 9, head.y - 20);
-    ctx.quadraticCurveTo(head.x + 12, head.y - 13, head.x + 10, head.y - 7);
-    ctx.fill();
-    // The restrained eye remains readable in the pale landscape.
-    ctx.fillStyle = '#e0e6d8';
-    ctx.beginPath();
-    ctx.ellipse(head.x + 9, head.y - 1.1, 1.55, 0.92, -0.1, 0, TAU);
-    ctx.fill();
-    ctx.fillStyle = '#101719';
-    ctx.fillRect(head.x + 9.1, head.y - 2.1, 0.55, 1.8);
-    ctx.strokeStyle = 'rgba(28, 36, 38, 0.6)';
-    ctx.lineWidth = 0.6;
-    ctx.beginPath();
-    ctx.moveTo(head.x + 14, head.y + 5);
-    ctx.quadraticCurveTo(head.x + 21, head.y + 3, head.x + 24, head.y + 4);
-    ctx.moveTo(head.x + 13, head.y + 6);
-    ctx.quadraticCurveTo(head.x + 20, head.y + 6, head.x + 24, head.y + 8);
-    ctx.stroke();
-  }
-
-  _drawSkeleton(ctx) {
-    const { hip, shoulder, neck, head, base, tail } = this.pose;
-    ctx.save();
-    ctx.strokeStyle = '#e6ca91';
-    ctx.fillStyle = '#e6ca91';
-    ctx.lineWidth = 1.05;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.shadowColor = 'rgba(230, 202, 145, 0.25)';
-    ctx.shadowBlur = 3;
-    for (const leg of this.legs) {
-      ctx.globalAlpha = leg.far ? 0.36 : 0.9;
-      const { root, joint, ankle, paw } = leg.pose;
-      ctx.beginPath();
-      ctx.moveTo(root.x, root.y);
-      ctx.lineTo(joint.x, joint.y);
-      ctx.lineTo(ankle.x, ankle.y);
-      ctx.lineTo(paw.x + 3, paw.y);
-      ctx.stroke();
-      for (const jointPoint of [root, joint, ankle]) this._joint(ctx, jointPoint, 1.7);
-    }
-    ctx.globalAlpha = 0.9;
-    ctx.beginPath();
-    ctx.moveTo(hip.x - 4, hip.y - 5);
-    ctx.bezierCurveTo(-14, base - 7 + this.pose.flex, 10, base - 5, shoulder.x, shoulder.y - 7);
-    ctx.quadraticCurveTo(neck.x, neck.y - 5, head.x - 1, head.y);
-    ctx.stroke();
-    // Visible vertebrae and rib arcs make the axial skeleton inspectable.
-    for (let i = 0; i < 10; i += 1) {
-      const t = i / 9;
-      const x = lerp(hip.x - 1, shoulder.x - 2, t);
-      const y = base - 5 + Math.sin(t * Math.PI) * this.pose.flex * 0.4;
-      this._joint(ctx, point(x, y), 1.1);
-    }
-    ctx.globalAlpha = 0.65;
-    for (let i = 0; i < 6; i += 1) {
-      const x = 3 + i * 3.4;
-      ctx.beginPath();
-      ctx.moveTo(x, base - 5);
-      ctx.bezierCurveTo(x + 5, base - 2, x + 6, base + 9, x + 2, base + 10);
-      ctx.stroke();
-    }
-    ctx.beginPath();
-    ctx.ellipse(hip.x, hip.y - 0.5, 6, 4.5, -0.25, 0, TAU);
-    ctx.moveTo(shoulder.x - 8, shoulder.y - 10);
-    ctx.lineTo(shoulder.x + 3, shoulder.y - 7);
-    ctx.lineTo(shoulder.x, shoulder.y + 2);
-    ctx.closePath();
-    ctx.stroke();
-    ctx.globalAlpha = 0.8;
-    ctx.beginPath();
-    ctx.ellipse(head.x + 2, head.y + 1, 9, 7, -0.1, 0, TAU);
-    ctx.moveTo(head.x + 9, head.y + 3);
-    ctx.lineTo(head.x + 15, head.y + 4);
-    ctx.lineTo(head.x + 9, head.y + 7);
-    ctx.stroke();
-    ctx.globalAlpha = 0.55;
-    ctx.beginPath();
-    ctx.moveTo(tail[0].x, tail[0].y);
-    this._smoothPath(ctx, tail.slice(1));
-    ctx.stroke();
-    for (let i = 1; i < tail.length; i += 1) this._joint(ctx, tail[i], 0.85);
-    ctx.restore();
-  }
-
-  _joint(ctx, location, radius) {
-    ctx.beginPath();
-    ctx.arc(location.x, location.y, radius, 0, TAU);
-    ctx.fill();
-  }
+  draw(ctx, options = {}) { drawCat(ctx, this, options); }
 
   getTelemetry() {
     return { speed: this._speed, grounded: this.grounded, gait: this.gait, effort: this._effort };

@@ -33,21 +33,30 @@ const jump = async hold => {
   for (let i = 0; i < 34; i++) { await wait(35); samples.push(await state()); }
   if (hold) await page.keyboard.up('s');
   const final = await state();
-  return { height: Math.max(...samples.map(s => s.terrainY - 44 - s.y)), final };
+  return { height: Math.max(...samples.map(s => s.supportY - s.supportHeight - s.y)), final };
 };
 try {
   await page.goto(url); await page.waitForFunction(() => window.felis?.getState);
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   if (artifacts) await page.screenshot({ path: join(artifacts, 'desktop.png') });
+  const resting = await state();
+  verify('the closed room starts in manual mode with a laser objective', resting.room === 'salotto' && !resting.autoChase && resting.score === 0 && Number.isFinite(resting.laser.x) && Number.isFinite(resting.laser.y));
+  verify('smaller physical anatomy has scaled support height', Math.abs(resting.size - .6) < 1e-12 && Math.abs(resting.supportHeight - 44 * resting.size) < 1e-12 && Math.abs(resting.y - resting.supportY + resting.supportHeight) < .01);
   await page.keyboard.down('ArrowRight'); await wait(80); const accelerating = await state();
   await page.waitForFunction(() => window.felis.getState().vx >= 137); const walking = await state();
   verify('accelerates to walking speed', accelerating.vx > 0 && accelerating.vx < walking.vx && Math.abs(walking.vx - 138) < 2);
   await page.keyboard.down('a'); await page.waitForFunction(() => window.felis.getState().vx >= 309); const running = await state();
   verify('A accelerates to running speed', Math.abs(running.vx - 310) < 2);
+  const runningRig = await page.evaluate(() => window.felis.getRig());
+  const boneDistance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  verify('the live running cat preserves anatomical bone lengths', runningRig.legs.every(leg => Math.abs(boneDistance(leg.pose.root, leg.pose.joint) - (leg.kind === 'hind' ? 22 : 18)) < 1e-6 && Math.abs(boneDistance(leg.pose.joint, leg.pose.ankle) - (leg.kind === 'hind' ? 24 : 20)) < 1e-6));
+  await wait(100); const animated = await state();
+  verify('running advances the observed pose cycle', animated.phase !== running.phase && animated.vx > 300);
   await page.keyboard.up('ArrowRight'); await page.keyboard.up('a'); await wait(80); const coasting = await state();
-  verify('release retains inertia', coasting.vx > 0 && coasting.vx < running.vx && coasting.x > running.x);
-  await page.waitForFunction(() => window.felis.getState().vx === 0, null, { timeout: 5000 });
-  await page.keyboard.down('ArrowRight'); await page.waitForFunction(() => window.felis.getState().vx >= 137);
+  verify('release brakes decisively while retaining brief inertia', coasting.vx > 120 && coasting.vx < 250 && coasting.x > animated.x);
+  await page.waitForFunction(() => window.felis.getState().vx === 0, null, { timeout: 1000 });
+  verify('release stops promptly inside the room', (await state()).x - animated.x > 25 && (await state()).x - animated.x < 50);
+  await reset(); await page.keyboard.down('ArrowRight'); await page.waitForFunction(() => window.felis.getState().vx >= 137);
   const beforeReversal = await state(); await page.keyboard.up('ArrowRight'); await page.keyboard.down('ArrowLeft'); await wait(35); const braking = await state();
   await page.waitForFunction(() => window.felis.getState().vx <= -137); const reversed = await state(); await page.keyboard.up('ArrowLeft');
   verify('reversal brakes before facing left', braking.vx > 0 && braking.vx < beforeReversal.vx && reversed.facing === -1);
@@ -63,7 +72,7 @@ try {
   const paused = await state(); await wait(200); const frozen = await state();
   verify('space pauses physics', paused.paused && frozen.x === paused.x && frozen.y === paused.y);
   await page.keyboard.up('ArrowRight'); await page.keyboard.press('Space'); verify('space resumes', !(await state()).paused);
-  await reset(); const resetState = await state(); verify('R resets simulation', resetState.x === 0 && resetState.vx === 0 && resetState.jumpCount === 0);
+  await reset(); const resetState = await state(); verify('R resets simulation', resetState.x === resting.x && resetState.vx === 0 && resetState.jumpCount === 0 && resetState.score === 0 && !resetState.autoChase);
   await page.locator('#help').click(); verify('instructions pause simulation', (await state()).paused && await page.locator('#instructions').evaluate(el => el.open));
   await page.locator('#close-help').click(); await page.waitForFunction(() => !window.felis.getState().paused); verify('closing instructions resumes', !(await page.locator('#instructions').evaluate(el => el.open)));
   await page.locator('#help').focus(); await page.keyboard.press('Space');
@@ -102,15 +111,45 @@ try {
   const right = await page.locator('[data-hold="right"]').boundingBox();
   await page.mouse.move(right.x + right.width / 2, right.y + right.height / 2); await page.mouse.down(); await wait(600);
   verify('onscreen direction holds', (await state()).vx > 130); await page.mouse.up(); await reset();
+  const placeLaser = async (x, y) => {
+    const current = await state(), view = current.view;
+    await page.mouse.click(view.width / 2 + (x - view.cameraX) * view.scale, view.floor + y * view.scale);
+    await wait(25);
+  };
+  await reset(); const beforePointer = await state();
+  await placeLaser(beforePointer.x + 60, -2); const placed = await state();
+  verify('pointer places a reachable red laser without moving the cat', Math.abs(placed.laser.x - beforePointer.x - 60) < 3.1 && placed.laser.y === -2 && placed.x === beforePointer.x);
+  await page.keyboard.down('ArrowRight'); await page.waitForFunction(() => window.felis.getState().score >= 1, null, { timeout: 3000 }); await page.keyboard.up('ArrowRight');
+  verify('manual movement catches the laser and earns a point', (await state()).score >= 1);
+  await page.waitForFunction(() => document.querySelector('#score').textContent === String(window.felis.getState().score).padStart(2, '0'));
+  verify('the objective score updates on screen', (await page.locator('#score').innerText()) === String((await state()).score).padStart(2, '0'));
+  await reset(); await page.locator('#instinct').click();
+  verify('instinct button enables automatic pursuit', (await state()).autoChase && await page.locator('#instinct').getAttribute('aria-pressed') === 'true');
+  await page.waitForFunction(() => window.felis.getState().score >= 1, null, { timeout: 4000 });
+  verify('automatic pursuit catches the floor objective', (await state()).score >= 1);
+  await page.locator('#instinct').click(); verify('instinct button returns to manual control', !(await state()).autoChase);
+  await reset(); await placeLaser(-195, -30);
+  verify('pointer targets the top of solid furniture', Math.abs((await state()).laser.x + 195) < 3.1 && (await state()).laser.y === -30);
+  await page.keyboard.press('i'); verify('I enables instinct mode', (await state()).autoChase);
+  await page.waitForFunction(() => window.felis.getState().platformId === 'ottoman', null, { timeout: 7000 });
+  const onFurniture = await state();
+  verify('automatic pursuit jumps onto furniture', onFurniture.jumpCount >= 1 && onFurniture.platformId === 'ottoman' && onFurniture.supportY === -28);
+  await page.waitForFunction(() => window.felis.getState().score >= 1, null, { timeout: 4000 });
+  verify('the furniture objective can be caught', (await state()).score >= 1);
+  await page.keyboard.press('ArrowRight'); verify('arrow input overrides automatic pursuit', !(await state()).autoChase);
+  await page.keyboard.press('i'); await page.keyboard.press('s');
+  verify('jump input also overrides automatic pursuit', !(await state()).autoChase);
+  await reset();
   for (const viewport of [{ width: 390, height: 844 }, { width: 320, height: 720 }, { width: 844, height: 390 }]) {
     await page.setViewportSize(viewport); await wait(100);
-    const fits = await page.evaluate(() => ! (document.documentElement.scrollWidth > innerWidth) && [...document.querySelectorAll('.controls button, .toolbar button')].every(el => {
+    const fits = await page.evaluate(() => ! (document.documentElement.scrollWidth > innerWidth) && [...document.querySelectorAll('.controls button, .toolbar button, #instinct')].every(el => {
       const r = el.getBoundingClientRect(); return r.x >= 0 && r.y >= 0 && r.right <= innerWidth + .1 && r.bottom <= innerHeight + .1;
     }));
     verify(`controls fit ${viewport.width}x${viewport.height}`, fits);
   }
   const touchPage = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
   observeErrors(touchPage); await touchPage.goto(url); await touchPage.waitForFunction(() => window.felis?.getState);
+  await touchPage.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
   if (artifacts) await touchPage.screenshot({ path: join(artifacts, 'mobile.png') });
   const cdp = await touchPage.context().newCDPSession(touchPage);
   const center = async selector => { const r = await touchPage.locator(selector).boundingBox(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; };
