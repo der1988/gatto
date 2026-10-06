@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#f5f5f0" />
+    <meta name="description" content="Felis: un gatto, una radura silenziosa. Un simulatore di movimento con scheletro articolato, inerzia e gravità." />
+    <title>Felis — Segui l’istinto</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="scene" aria-label="Simulatore di gatto in una radura nebbiosa, con vista laterale"></canvas>
+    <div class="grain" aria-hidden="true"></div>
+    <header class="header">
+      <a class="brand" href="./" aria-label="Felis, ricomincia">
+        <svg class="brand-symbol" viewBox="0 0 36 36" fill="none" aria-hidden="true"><path d="M9 25V9l7 6h4l7-6v16l-9 6-9-6Z" stroke="currentColor" stroke-width="1.4"/><path d="m12 21 3 1m9-1-3 1m-5 4h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        <span>felis<span class="brand-dot">.</span></span>
+      </a>
+      <div class="edition"><span class="tiny-dot"></span> SIMULATORE DI MOVIMENTO <span class="edition-divider">/</span> 001</div>
+      <nav class="toolbar" aria-label="Opzioni simulatore">
+        <button class="icon-button" id="sound" aria-label="Attiva suoni ambientali" aria-pressed="false" title="Suoni ambientali">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="m11 5-5 4H3v6h3l5 4V5Z"/><path class="sound-off" d="m16 9 5 6m0-6-5 6"/><path class="sound-on" d="M15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg>
+        </button>
+        <button class="icon-button" id="pause" aria-label="Metti in pausa" aria-pressed="false" title="Pausa (Spazio)">
+          <svg class="pause-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="7" y="6" width="3" height="12" rx=".7"/><rect x="14" y="6" width="3" height="12" rx=".7"/></svg>
+          <svg class="play-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m8 5 11 7-11 7V5Z"/></svg>
+        </button>
+        <button class="icon-button" id="reset" aria-label="Ricomincia" title="Ricomincia (R)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M4 10a8 8 0 1 1 1 7M4 4v6h6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <span class="toolbar-divider"></span>
+        <button class="help-button" id="help" aria-label="Apri le istruzioni" title="Istruzioni">?</button>
+      </nav>
+    </header>
+
+    <main>
+      <section class="intro" aria-label="Benvenuto">
+        <p class="eyebrow"><span></span> UN ESPERIMENTO DI NATURA</p>
+        <h1>Segui<br />l’istinto<span>.</span></h1>
+        <p class="intro-caption">Un gatto. Una radura. Nessuna fretta.</p>
+      </section>
+      <div class="anatomy-label" id="anatomy-label" hidden><span></span> SCHELETRO ARTICOLATO <small>4 zampe · colonna flessibile · coda</small></div>
+      <div class="pause-overlay" id="pause-overlay" hidden><span>Un momento di quiete.</span><button id="resume">Riprendi <span>↗</span></button></div>
+      <div class="first-hint" id="first-hint" aria-hidden="true">← <span>inizia a esplorare</span> →</div>
+    </main>
+
+    <footer class="footer">
+      <div class="location"><span class="location-title"><span class="location-index">01</span> La radura</span><span class="location-caption">IL MONDO È UN POSTO DA ESPLORARE</span></div>
+      <div class="controls" aria-label="Comandi">
+        <div class="control-group move-group">
+          <div class="key-pair"><button class="key" data-hold="left" aria-label="Muovi a sinistra">←</button><button class="key" data-hold="right" aria-label="Muovi a destra">→</button></div><span class="control-label">muoviti</span>
+        </div>
+        <span class="control-divider"></span>
+        <div class="control-group"><button class="key" data-hold="run" aria-label="Tieni premuto per correre">A</button><span class="control-label">corri</span></div>
+        <span class="control-divider"></span>
+        <div class="control-group"><button class="key" data-hold="jump" aria-label="Salta, tieni premuto per saltare più in alto">S</button><span class="control-label">salta</span></div>
+        <span class="control-divider"></span>
+        <button class="control-group skeleton-button" id="skeleton" aria-pressed="false"><span class="key">X</span><span class="control-label">scheletro</span></button>
+      </div>
+      <div class="telemetry"><span class="speed"><span id="speed">0.0</span><span class="speed-unit">m/s</span></span><span class="gait-line"><span class="motion-bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span id="gait">A RIPOSO</span></span></div>
+    </footer>
+    <div class="bottom-note"><span>FISICA REALE. CURIOSITÀ FELINA.</span><span id="anatomy-status">MOVIMENTO PROCEDURALE</span></div>
+
+    <dialog id="instructions" aria-labelledby="instructions-title">
+      <button class="dialog-close icon-button" id="close-help" aria-label="Chiudi istruzioni">×</button>
+      <p class="eyebrow">PICCOLO MANUALE DI ESPLORAZIONE</p>
+      <h2 id="instructions-title">Lasciati guidare<br />dalla curiosità.</h2>
+      <p class="help-intro">Ogni passo nasce dal movimento di uno scheletro articolato. Le zampe cercano il terreno, il corpo segue l’inerzia, la coda accompagna l’equilibrio.</p>
+      <dl class="help-keys"><div><dt>← →</dt><dd>Cammina a sinistra o a destra.</dd></div><div><dt>A + ← →</dt><dd>Tieni premuto A per correre e prendere slancio.</dd></div><div><dt>S</dt><dd>Salta. Tienilo premuto per un salto più alto.</dd></div><div><dt>X</dt><dd>Osserva le articolazioni sotto la silhouette.</dd></div><div><dt>Spazio / R</dt><dd>Fai una pausa / torna all’inizio.</dd></div></dl>
+      <p class="help-footnote">Puoi anche tenere premuti i comandi sullo schermo.<br />Non c’è un traguardo. C’è solo un mondo da attraversare.</p>
+      <button class="explore-button" id="explore">Torna nella radura <span>↗</span></button>
+    </dialog>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
